@@ -1,20 +1,8 @@
 #!/usr/bin/env python3
-"""
-CliTsSurv 数据预处理脚本
-将 seq.csv（时序数据）和 static.csv（静态+生存数据）合并为训练格式
+"""Preprocess longitudinal and static patient data for CliTsSurv.
 
-处理流程:
-  1. 加载 seq.csv 和 static.csv
-  2. 过滤掉生存数据缺失的样本
-  3. 合并时序和静态数据
-  4. 保存为 merged.parquet（供 CliTsSurvDataset 使用）
-  5. 计算时间区间边界 (time_bin_edges)
-
-输出:
-  - CliTsSurv_data/merged.parquet: 合并后的完整数据
-  - CliTsSurv_data/time_bin_edges.npy: 时间区间边界
-  - CliTsSurv_data/metadata.json: 数据元信息
-"""
+Merge seq.csv and static.csv, clean records, engineer and normalize features,
+and save merged data, time-bin boundaries and metadata in CliTsSurv_data."""
 
 import os
 import sys
@@ -23,9 +11,14 @@ import numpy as np
 import pandas as pd
 from pathlib import Path
 
+try:
+    from .survival_data_utils import remove_post_outcome_records
+except ImportError:  # direct execution: python data/data_preprocess_clitssurv.py
+    from survival_data_utils import remove_post_outcome_records
+
 
 def load_and_merge_data(data_dir: Path) -> pd.DataFrame:
-    """加载并合并 seq.csv 和 static.csv"""
+    """Load and merge seq.csv and static.csv."""
     print("\n[1/4] 加载原始数据...")
     
     seq_df = pd.read_csv(data_dir / "seq.csv", encoding='utf-8-sig')
@@ -33,8 +26,9 @@ def load_and_merge_data(data_dir: Path) -> pd.DataFrame:
 
     print(f"  seq.csv: {seq_df.shape}, 唯一ID: {seq_df['id'].nunique()}")
     print(f"  static.csv: {static_df.shape}, 唯一ID: {static_df['id'].nunique()}")
+    seq_df, static_df, _ = remove_post_outcome_records(seq_df, static_df)
     
-    # 过滤掉生存数据缺失的样本
+    # Drop samples with missing survival outcomes.
     valid_static = static_df[
         static_df['survival_months'].notna() & 
         static_df['survival_status'].notna()
@@ -42,28 +36,28 @@ def load_and_merge_data(data_dir: Path) -> pd.DataFrame:
     
     print(f"  过滤缺失生存数据后: {len(valid_static)}")
     
-    # 创建生存标签: 1=事件(死亡), 0=删失(存活或失访)
-    # survival_status=1 表示死亡事件
+    # Create survival labels: 1 = death, 0 = censoring (alive or lost to follow-up).
+    # survival_status == 1 indicates a death event.
     valid_static['event_indicator'] = (valid_static['survival_status'] == 1).astype(int)
     valid_static['time_to_event'] = valid_static['survival_months']
     
-    # 过滤 time_to_event <= 0 的患者（与 DDH 对齐）
+    # Exclude patients with time_to_event <= 0.
     valid_static = valid_static[valid_static['time_to_event'] > 0].copy()
     print(f"  过滤 time_to_event <= 0 后: {len(valid_static)}")
     
-    # 只保留在 seq 中也存在的 ID
+    # Keep IDs present in the longitudinal data.
     common_ids = set(seq_df['id'].unique()) & set(valid_static['id'].unique())
     print(f"  共同ID数: {len(common_ids)}")
     
     seq_df = seq_df[seq_df['id'].isin(common_ids)].copy()
     valid_static = valid_static[valid_static['id'].isin(common_ids)].copy()
     
-    # 合并数据: 将 static 的生存信息添加到 seq 的每一行
+    # Merge survival information into each longitudinal row.
     merge_cols = ['id', 'event_indicator', 'time_to_event', 'bloodtype_A', 'bloodtype_B', 'RH', 
                   'VTE', 'PE', 'CE', 'DM']
     static_subset = valid_static[merge_cols]
     
-    # Left merge: 每个时序记录都带上静态特征和生存标签
+    # Left join static features and survival labels onto longitudinal records.
     merged = seq_df.merge(static_subset, on='id', how='left')
     
     print(f"  合并后: {merged.shape}")
@@ -72,27 +66,23 @@ def load_and_merge_data(data_dir: Path) -> pd.DataFrame:
 
 
 def add_feature_engineering(merged_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    特征工程步骤（在归一化之前执行）:
-    1. 删除缺失率 >90% 的特征（噪声大，对模型几乎无贡献）
-    2. Per-patient 前向填充（ffill），减少需要 mask 的位置
-    3. 新增 delta_t 特征（相邻访问时间间隔，随访密度是预后信号）
-    4. 新增 comorbidity_count 静态特征（VTE+PE+CE+DM 合并病症数）
-    """
+    """Add log1p-transformed inter-visit intervals and comorbidity counts.
+
+Feature removal and forward filling remain disabled in the commented examples."""
     print("\n[FE] 特征工程...")
     
-    # # 1. 删除缺失率 >90% 的特征
+    # Optional: remove features with >90% missingness (disabled).
     # HIGH_MISSING_COLS = [
-    #     'NK%', 'BLY%', 'NK', 'ABLC',   # ~98% 缺失
-    #     'TLY%', 'CD8%', 'CD8', 'CD4%', 'CD4', 'CD4/CD8', 'ATLC', 'ALC',  # ~98% 缺失
-    #     'BNP',   # ~95% 缺失
-    #     'cTnI',  # ~90% 缺失
+    #     'NK%', 'BLY%', 'NK', 'ABLC',   # ~98% missing
+    #     'TLY%', 'CD8%', 'CD8', 'CD4%', 'CD4', 'CD4/CD8', 'ATLC', 'ALC',  # ~98% missing
+    #     'BNP',   # ~95% missing
+    #     'cTnI',  # ~90% missing
     # ]
     # cols_to_drop = [c for c in HIGH_MISSING_COLS if c in merged_df.columns]
     # merged_df = merged_df.drop(columns=cols_to_drop)
-    # print(f"  删除高缺失特征 ({len(cols_to_drop)}个): {cols_to_drop}")
+    # print(f"  Removed high-missingness features ({len(cols_to_drop)}): {cols_to_drop}")
 
-    # 2. Per-patient 前向填充（只对时序数值特征）
+    # Optional: forward-fill numerical longitudinal features per patient (disabled).
     # exclude_from_ffill = {
     #     'id', 'date', 'event_indicator', 'time_to_event',
     #     'bloodtype_A', 'bloodtype_B', 'RH', 'VTE', 'PE', 'CE', 'DM', 'comorbidity_count'
@@ -101,19 +91,19 @@ def add_feature_engineering(merged_df: pd.DataFrame) -> pd.DataFrame:
     #               if c not in exclude_from_ffill
     #               and merged_df[c].dtype in ['float64', 'float32', 'int64', 'int32']]
     
-    # # 按 (id, date) 排序，然后按患者 ffill
+    # Sort by (id, date), then forward-fill within each patient.
     # merged_df = merged_df.sort_values(['id', 'date']).reset_index(drop=True)
     # merged_df[ffill_cols] = merged_df.groupby('id')[ffill_cols].ffill()
-    # # 残余 NaN（第一次访问就缺失）保留，后续归一化时仍为 NaN，collate_fn 会 mask 掉
+    # Keep remaining NaNs through normalization; collate_fn masks missing values.
     # nan_ratio_after = merged_df[ffill_cols].isnull().mean().mean()
-    # print(f"  Per-patient ffill 后，平均缺失率: {nan_ratio_after:.2%}")
+    # print(f"  Mean missingness after per-patient ffill: {nan_ratio_after:.2%}")
 
-    # 3. 新增 delta_t 特征（相邻访问时间间隔，单位：月）
+    # Add delta_t: intervals between consecutive visits, in months.
     merged_df['delta_t'] = merged_df.groupby('id')['date'].diff().fillna(0.0)
-    merged_df['delta_t'] = np.log1p(merged_df['delta_t'])  # log1p 压缩长尾，避免极端 z-score
+    merged_df['delta_t'] = np.log1p(merged_df['delta_t'])  # Compress the long tail with log1p to limit extreme z-scores.
     print(f"  新增 delta_t 特征（log1p 变换后，相邻访问间隔），范围: {merged_df['delta_t'].min():.2f}~{merged_df['delta_t'].max():.2f}")
 
-    # 4. 新增 comorbidity_count 静态特征（每个患者的合并病症数，0~4）
+    # Add the static comorbidity count per patient (0 to 4).
     comorbidity_cols = [c for c in ['VTE', 'PE', 'CE', 'DM'] if c in merged_df.columns]
     if comorbidity_cols:
         merged_df['comorbidity_count'] = merged_df[comorbidity_cols].sum(axis=1)
@@ -123,10 +113,10 @@ def add_feature_engineering(merged_df: pd.DataFrame) -> pd.DataFrame:
 
 
 def split_feature_columns(merged_df: pd.DataFrame) -> dict:
-    """分离不同类型的特征列"""
+    """Identify longitudinal, static, identifier and outcome columns."""
     print("\n[2/4] 分离特征列...")
 
-    # 时序特征: 在 seq.csv 中的检验指标（排除id, date, 静态特征）
+    # Longitudinal measurements exclude identifiers, timestamps and static features.
     exclude_cols = {
         'id', 'date', 'event_indicator', 'time_to_event',
         'bloodtype_A', 'bloodtype_B', 'RH', 'VTE', 'PE', 'CE', 'DM', 'comorbidity_count',
@@ -136,11 +126,11 @@ def split_feature_columns(merged_df: pd.DataFrame) -> dict:
         'last_contact_time', 'desc'
     }
 
-    # 时序特征列（包含新增的 delta_t）
+    # Longitudinal feature columns, including delta_t.
     seq_feature_cols = [c for c in merged_df.columns
                         if c not in exclude_cols and merged_df[c].dtype in ['float64', 'float32', 'int64', 'int32']]
 
-    # 静态特征列（从 static 合并过来的 + comorbidity_count）
+    # Static feature columns, including comorbidity_count.
     static_feature_cols = ['bloodtype_A', 'bloodtype_B', 'RH', 'VTE', 'PE', 'CE', 'DM', 'comorbidity_count']
     static_feature_cols = [c for c in static_feature_cols if c in merged_df.columns]
 
@@ -159,14 +149,14 @@ def split_feature_columns(merged_df: pd.DataFrame) -> dict:
 
 
 def compute_time_bins(merged_df: pd.DataFrame, num_bins: int = 10) -> np.ndarray:
-    """计算时间区间边界用于 DeepHit 离散化"""
+    """Compute equal-width boundaries for discrete survival prediction."""
     print(f"\n[3/4] 计算时间区间边界 (num_bins={num_bins})...")
     
     tte = merged_df['time_to_event'].values
     tte_min, tte_max = tte.min(), tte.max()
     
-    # 等宽分箱
-    bin_edges = np.linspace(tte_min, tte_max * 1.2, num_bins + 1)  # 留 20% 余量
+    # Equal-width time bins.
+    bin_edges = np.linspace(tte_min, tte_max * 1.2, num_bins + 1)  # Allow a 20% margin.
     
     print(f"  时间范围: [{tte_min:.1f}, {tte_max:.1f}] 月")
     print(f"  区间边界: {bin_edges}")
@@ -178,33 +168,33 @@ def compute_time_bins(merged_df: pd.DataFrame, num_bins: int = 10) -> np.ndarray
 
 def normalize_and_save(merged_df: pd.DataFrame, feature_info: dict,
                        bin_edges: np.ndarray, output_dir: Path):
-    """归一化并保存数据"""
+    """Normalize features and save the processed data and metadata."""
     print("\n[4/4] 归一化并保存...")
 
     output_dir.mkdir(exist_ok=True)
 
-    # 分离时序特征和静态特征
+    # Separate longitudinal and static feature columns.
     seq_cols = feature_info['seq_feature_cols']
     static_cols = feature_info['static_feature_cols']
 
-    # 计算归一化参数（只从时序数据中计算）
-    # 时序特征: 按列计算均值和标准差
+    # Compute normalization parameters from the merged data.
+    # Compute column-wise means and standard deviations for longitudinal features.
     seq_means = merged_df[seq_cols].mean()
     seq_stds = merged_df[seq_cols].std()
-    seq_stds = seq_stds.replace(0, 1)  # 避免除以0
+    seq_stds = seq_stds.replace(0, 1)  # Avoid division by zero.
 
-    # 静态特征: 同样归一化
+    # Normalize static features in the same way.
     static_means = merged_df[static_cols].mean()
     static_stds = merged_df[static_cols].std()
     static_stds = static_stds.replace(0, 1)
 
-    # 应用归一化
+    # Apply normalization.
     for col in seq_cols:
         merged_df[col] = (merged_df[col] - seq_means[col]) / seq_stds[col]
     for col in static_cols:
         merged_df[col] = (merged_df[col] - static_means[col]) / static_stds[col]
 
-    # 保存合并后的数据 (CSV 格式方便查看，parquet 格式方便快速读取)
+    # Save CSV for inspection and Parquet for efficient loading.
     csv_path = output_dir / "merged.csv"
     merged_df.to_csv(csv_path, index=False, encoding='utf-8-sig')
     print(f"  合并数据 (CSV) -> {csv_path}")
@@ -213,12 +203,12 @@ def normalize_and_save(merged_df: pd.DataFrame, feature_info: dict,
     merged_df.to_parquet(parquet_path, index=False)
     print(f"  合并数据 (Parquet) -> {parquet_path}")
 
-    # 保存时间区间边界
+    # Save time-bin boundaries.
     bin_edges_path = output_dir / "time_bin_edges.npy"
     np.save(bin_edges_path, bin_edges)
     print(f"  时间区间边界 -> {bin_edges_path}")
 
-    # 保存元数据
+    # Save metadata.
     meta = {
         'n_samples': len(merged_df),
         'n_unique_ids': merged_df['id'].nunique(),
@@ -258,11 +248,11 @@ def main():
     print("CliTsSurv 数据预处理")
     print("=" * 60)
     
-    # 路径设置
+    # Configure paths.
     data_dir = Path(__file__).parent
     output_dir = data_dir / "CliTsSurv_data"
     
-    # 运行处理流程
+    # Run preprocessing.
     merged_df = load_and_merge_data(data_dir)
     merged_df = add_feature_engineering(merged_df)
     feature_info = split_feature_columns(merged_df)
@@ -284,12 +274,12 @@ from torch.utils.data import DataLoader
 import pandas as pd
 import json
 
-# 加载数据
+# Load data.
 meta = json.load(open('data/CliTsSurv_data/metadata.json'))
 df = pd.read_parquet('data/CliTsSurv_data/merged.parquet')
 time_bin_edges = meta['time_bin_edges']
 
-# 创建 Dataset
+# Create the dataset.
 dataset = CliTsSurvDataset(
     df=df,
     feature_cols=meta['seq_feature_cols'],
@@ -301,7 +291,7 @@ dataset = CliTsSurvDataset(
     embedding_dim=6
 )
 
-# 创建 DataLoader
+# Create the data loader.
 dataloader = DataLoader(
     dataset, 
     batch_size=32, 
@@ -309,7 +299,7 @@ dataloader = DataLoader(
     collate_fn=lambda b: collate_fn(b, infer=False, device='cuda')
 )
 
-# 训练
+# Train the model.
 model.train_model(dataloader, ..., time_bin_edges=time_bin_edges)
     """)
 

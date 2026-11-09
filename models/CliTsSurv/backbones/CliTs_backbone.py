@@ -95,9 +95,10 @@ class CliTs_backbone(nn.Module):
         return return_z
 
     def forward(self, x, lens):
-        x_ = nn.utils.rnn.pack_padded_sequence(x, lens, batch_first=True, enforce_sorted=False)
+        packed_lens = lens.detach().to(device='cpu', dtype=torch.int64)
+        x_ = nn.utils.rnn.pack_padded_sequence(x, packed_lens, batch_first=True, enforce_sorted=False)
         r_out, hidden = self.rnn(x_, None)
-        r_out, lens = nn.utils.rnn.pad_packed_sequence(r_out, batch_first=True, total_length=x.shape[1])
+        r_out, _ = nn.utils.rnn.pad_packed_sequence(r_out, batch_first=True, total_length=x.shape[1])
         # Return all time points' outputs instead of just the last one
         return r_out, lens  # (batch, T, hidden_size), (batch,)
 

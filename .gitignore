@@ -1,0 +1,36 @@
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+
+# Large data files
+data/**/*.csv
+data/**/*.parquet
+data/**/*.npy
+data/**/*.pkl
+data/**/*.h5
+data/**/*.xlsx
+data/*_data/
+data/raw/*.csv
+data/raw/*.xlsx
+data/raw/*.json
+data/text_embedding/
+
+# Checkpoints (large model files)
+checkpoints/
+
+# Downloaded models
+models/Qwen-Embedding/
+
+# Results
+results/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Env
+.env
+.deps/
+.mplconfig/
+*.egg-info/

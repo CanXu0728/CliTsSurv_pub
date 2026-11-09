@@ -5,7 +5,8 @@ import os
 from .backbones.LatentEncoder import LatentEncoder
 from .backbones.CliTs_backbone import CliTsSurv_backbone
 from .backbones.time_embedding import build_time_encoder
-from .metrices import deephit_loss, brier_loss
+from .metrices import (brier_loss, conditional_event_distribution,
+                       conditional_survival_curve, deephit_loss)
 from sksurv.metrics import concordance_index_censored
 from .augmenters.seq_augmenters import *
 
@@ -52,17 +53,34 @@ class CliTsSurv(nn.Module):
         self.time_bin_edges = None
 
 
-    def loss_fn(self, pred, time_bins, event_indicator,
+    def loss_fn(self, pred, time_bins, event_indicator, observation_bins,
                 recon, recon_target, static_recon, static_recon_target,
                 recon_mask=None, disc_pred=None, disc_label=None,
-                static_recon_mask=None, static_disc_pred=None, static_disc_label=None):
-        """Combined DeepHit + VAE reconstruction + Brier calibration loss"""
-        loss_enc, _, _ = self.encoder.loss_fn(recon, recon_target, recon_mask, disc_pred, disc_label)
-        loss_static_enc, _, _ = self.static_encoder.loss_fn(static_recon, static_recon_target,
-                                                             static_recon_mask, static_disc_pred,
-                                                             static_disc_label)
-        loss_survival = deephit_loss(pred, time_bins, event_indicator, self.alpha, self.sigma)
-        loss_brier = brier_loss(pred, time_bins, event_indicator, self.num_time_bins)
+                static_recon_mask=None, static_disc_pred=None, static_disc_label=None,
+                sample_weights=None, rank_sample_weights=None,
+                include_survival_ranking=True, include_reconstruction=True):
+        """Combined survival, autoencoder reconstruction and Brier loss."""
+        if include_reconstruction:
+            loss_enc, _, _ = self.encoder.loss_fn(
+                recon, recon_target, recon_mask, disc_pred, disc_label
+            )
+            loss_static_enc, _, _ = self.static_encoder.loss_fn(
+                static_recon, static_recon_target, static_recon_mask,
+                static_disc_pred, static_disc_label
+            )
+        else:
+            loss_enc = pred.new_zeros(())
+            loss_static_enc = pred.new_zeros(())
+        loss_survival = deephit_loss(
+            pred, time_bins, event_indicator, self.alpha, self.sigma,
+            observation_bins=observation_bins, sample_weights=sample_weights,
+            rank_sample_weights=rank_sample_weights,
+            include_ranking=include_survival_ranking
+        )
+        loss_brier = brier_loss(
+            pred, time_bins, event_indicator, self.num_time_bins,
+            observation_bins=observation_bins, sample_weights=sample_weights
+        )
 
         loss_enc = torch.where(torch.isnan(loss_enc), 0, loss_enc)
         loss_static_enc = torch.where(torch.isnan(loss_static_enc), 0, loss_static_enc)
@@ -72,6 +90,34 @@ class CliTsSurv(nn.Module):
                       + self.beta2 * loss_static_enc
                       + self.gamma * loss_brier)
         return total_loss, loss_survival, loss_enc, loss_static_enc, loss_brier
+
+    def _observation_bins(self, x, lens, times, time_bin_edges=None):
+        """Return the first bin ending after the last non-zero observation."""
+        lens_t = torch.as_tensor(lens, dtype=torch.long, device=x.device)
+        step_idx = torch.arange(x.shape[1], device=x.device).unsqueeze(0)
+        within_sequence = step_idx < lens_t.unsqueeze(1)
+        nonzero_step = (x.abs() > 1e-8).any(dim=-1) & within_sequence
+        if not torch.all(nonzero_step.any(dim=1)):
+            raise ValueError('Each sequence must contain a non-zero observation')
+
+        last_nonzero_idx = torch.where(
+            nonzero_step, step_idx, torch.full_like(step_idx, -1)
+        ).max(dim=1).values
+        raw_times = times.squeeze(-1)
+        observation_times = raw_times.gather(1, last_nonzero_idx.unsqueeze(1)).squeeze(1)
+
+        edges = time_bin_edges if time_bin_edges is not None else self.time_bin_edges
+        if edges is None:
+            observation_bins = observation_times.long().clamp(0, self.num_time_bins)
+        else:
+            upper_edges = torch.as_tensor(
+                np.asarray(edges)[1:], dtype=observation_times.dtype,
+                device=observation_times.device
+            )
+            observation_bins = torch.searchsorted(
+                upper_edges, observation_times.contiguous(), right=True
+            ).clamp(0, self.num_time_bins)
+        return observation_bins, observation_times
             
         
     def build_mask(self, lens, T, K):
@@ -169,7 +215,9 @@ class CliTsSurv(nn.Module):
     def train_model(self, train_dataloader, test_dataloader, epochs=100, lr=0.0001,
                     save_dir='./train', time_bin_edges=None,
                     optimizer_type='adam', optimizer_kwargs=None,
-                    early_stopping_patience=8):
+                    early_stopping_patience=8, ranking_dataloader=None,
+                    balanced_reconstruction=False,
+                    validation_metric_fn=None):
         """
         Args:
             time_bin_edges: array of time bin boundaries for converting continuous time to bins
@@ -206,14 +254,16 @@ class CliTsSurv(nn.Module):
         else:  # default: adam
             optimizer = torch.optim.Adam(param_groups, lr=lr, **optimizer_kwargs)
 
-        best_score = 0
+        best_score = (-np.inf, -np.inf) if validation_metric_fn else -np.inf
         best_epoch = 0
         loss_hist = []
+        selection_hist = []
         global_step = 0
         no_improve_count = 0
         
         for epoch in range(epochs):
             self.train()
+            ranking_iterator = iter(ranking_dataloader) if ranking_dataloader is not None else None
             epoch_losses = []
             epoch_survival_losses = []
             epoch_rec_losses = []
@@ -230,6 +280,10 @@ class CliTsSurv(nn.Module):
                 times = batch[5]
                 mask_nan = batch[6]
                 mask_nan_static = batch[7]
+
+                observation_bins, _ = self._observation_bins(
+                    x, lens, times, time_bin_edges
+                )
                 
                 pred, recon, disc_pred, static_recon, static_disc_pred = self.forward(
                     x, static_x, lens, times, labels=event_indicator
@@ -254,12 +308,79 @@ class CliTsSurv(nn.Module):
                 else:
                     static_disc_label = None
                     
+                sample_weights = None
+                if hasattr(self, 'sampling_importance_event'):
+                    sample_weights = torch.where(
+                        event_indicator > 0.5,
+                        torch.full_like(event_indicator, self.sampling_importance_event),
+                        torch.ones_like(event_indicator),
+                    )
                 loss, loss_survival, loss_rec, loss_static_rec, loss_brier = self.loss_fn(
-                    pred, time_bins, event_indicator,
+                    pred, time_bins, event_indicator, observation_bins,
                     recon, x, static_recon, static_x,
                     mask_nan, disc_pred, disc_label,
-                    mask_nan_static, static_disc_pred, static_disc_label
+                    mask_nan_static, static_disc_pred, static_disc_label,
+                    sample_weights=sample_weights,
+                    include_survival_ranking=ranking_dataloader is None,
+                    include_reconstruction=not balanced_reconstruction,
                 )
+
+                if ranking_iterator is not None:
+                    try:
+                        rank_batch = next(ranking_iterator)
+                    except StopIteration:
+                        ranking_iterator = iter(ranking_dataloader)
+                        rank_batch = next(ranking_iterator)
+                    rx, rsx, rtte, revent, rlens, rtimes = rank_batch[:6]
+                    rmask_nan, rmask_nan_static = rank_batch[6:8]
+                    robs_bins, _ = self._observation_bins(
+                        rx, rlens, rtimes, time_bin_edges
+                    )
+                    rpred, rrecon, rdisc_pred, rstatic_recon, rstatic_disc_pred = self.forward(
+                        rx, rsx, rlens, rtimes, labels=revent
+                    )
+                    if time_bin_edges is not None:
+                        rtime_bins = torch.searchsorted(
+                            torch.tensor(time_bin_edges[1:], device=rpred.device),
+                            rtte,
+                        ).clamp(0, self.num_time_bins - 1)
+                    else:
+                        rtime_bins = rtte.long()
+                    rank_only_loss = deephit_loss(
+                        rpred, rtime_bins, revent, self.alpha, self.sigma,
+                        observation_bins=robs_bins, include_nll=False,
+                        include_ranking=True,
+                    )
+                    balanced_reconstruction_loss = rpred.new_zeros(())
+                    if balanced_reconstruction:
+                        rdisc_label = (torch.ones_like(rdisc_pred)
+                                       if rdisc_pred is not None else None)
+                        rstatic_disc_label = (
+                            torch.ones_like(rstatic_disc_pred)
+                            if rstatic_disc_pred is not None else None
+                        )
+                        balanced_rec, _, _ = self.encoder.loss_fn(
+                            rrecon, rx, rmask_nan, rdisc_pred, rdisc_label
+                        )
+                        balanced_static_rec, _, _ = self.static_encoder.loss_fn(
+                            rstatic_recon, rsx, rmask_nan_static,
+                            rstatic_disc_pred, rstatic_disc_label
+                        )
+                        balanced_rec = torch.where(
+                            torch.isnan(balanced_rec), 0, balanced_rec
+                        )
+                        balanced_static_rec = torch.where(
+                            torch.isnan(balanced_static_rec), 0,
+                            balanced_static_rec
+                        )
+                        balanced_reconstruction_loss = (
+                            self.beta1 * balanced_rec
+                            + self.beta2 * balanced_static_rec
+                        )
+                        loss_rec = balanced_rec
+                        loss_static_rec = balanced_static_rec
+                    loss = loss + rank_only_loss + balanced_reconstruction_loss
+                    loss_survival = loss_survival + rank_only_loss
                 
                 optimizer.zero_grad()
                 loss.backward()
@@ -280,21 +401,37 @@ class CliTsSurv(nn.Module):
             train_brier_loss = np.mean(epoch_brier_losses)
             loss_hist.append(str(train_loss))
 
-            cindex, val_loss, val_survival_loss, val_brier_loss = self.test_model(test_dataloader, time_bin_edges)
-
             print('[Epoch %d] train loss: %.4f (survival: %.4f, rec: %.4f, static_rec: %.4f, brier: %.4f)' %
                   (epoch, train_loss, train_survival_loss, train_rec_loss, train_static_rec_loss, train_brier_loss))
-            print('val loss: %.4f | val survival loss: %.4f | c-index: %.4f, brier: %.4f' % 
-                  (val_loss, val_survival_loss, cindex, val_brier_loss))
-            
-            score = np.mean([cindex, 1 - val_brier_loss])  # You can also consider other metrics or a combination for model selection
+
+            if validation_metric_fn is not None:
+                # Match checkpoint selection to the final conditional evaluation:
+                # mean IPCW C-index is primary and lower conditional IBS breaks ties.
+                selection_ipcw, selection_ibs = validation_metric_fn(self)
+                score = (float(selection_ipcw), -float(selection_ibs))
+                selection_hist.append(
+                    (epoch, float(selection_ipcw), float(selection_ibs))
+                )
+                print('selection mean IPCW: %.4f | selection IBS: %.4f' %
+                      (selection_ipcw, selection_ibs))
+            else:
+                # Backward-compatible fallback for legacy callers.
+                cindex, val_loss, val_survival_loss, val_brier_loss = \
+                    self.test_model(test_dataloader, time_bin_edges)
+                print('val loss: %.4f | val survival loss: %.4f | c-index: %.4f, brier: %.4f' %
+                      (val_loss, val_survival_loss, cindex, val_brier_loss))
+                score = np.mean([cindex, 1 - val_brier_loss])
 
             if score > best_score:
                 torch.save(self.state_dict(), os.path.join(save_dir, './best.pt'))
                 best_score = score
                 best_epoch = epoch
                 no_improve_count = 0
-                print('update best score %.4f, model saved' % best_score)
+                if validation_metric_fn is not None:
+                    print('update best: mean IPCW %.4f, IBS %.4f, model saved' %
+                          (best_score[0], -best_score[1]))
+                else:
+                    print('update best score %.4f, model saved' % best_score)
             else:
                 no_improve_count += 1
 
@@ -306,11 +443,22 @@ class CliTsSurv(nn.Module):
                 torch.save(self.state_dict(), os.path.join(save_dir, 'epoch_%d.pt'%epoch))
 
         print('training finished', '='*50)
-        print('best score %.4f at epoch %d' % (best_score, best_epoch))
+        if validation_metric_fn is not None:
+            print('best mean IPCW %.4f, IBS %.4f at epoch %d' %
+                  (best_score[0], -best_score[1], best_epoch))
+        else:
+            print('best score %.4f at epoch %d' % (best_score, best_epoch))
         
         with open(os.path.join(save_dir, 'loss_hist'), 'w+', encoding='utf8', newline='') as f:
             loss_hist = list(map(lambda x: str(x)+'\n', loss_hist))
             f.writelines(loss_hist)
+
+        if selection_hist:
+            with open(os.path.join(save_dir, 'selection_hist.csv'), 'w+',
+                      encoding='utf8', newline='') as f:
+                f.write('epoch,mean_ipcw,ibs\n')
+                for row in selection_hist:
+                    f.write(','.join(map(str, row)) + '\n')
 
         self.load_state_dict(torch.load(os.path.join(save_dir, './best.pt'), weights_only=True))
         
@@ -335,6 +483,10 @@ class CliTsSurv(nn.Module):
                 times = batch[5]
                 mask_nan = batch[6]
                 mask_nan_static = batch[7]
+
+                observation_bins, _ = self._observation_bins(
+                    x, lens, times, time_bin_edges
+                )
                 
                 pred, recon, disc_pred, static_recon, static_disc_pred = self.forward(
                     x, static_x, lens, times, labels=event_indicator
@@ -360,7 +512,7 @@ class CliTsSurv(nn.Module):
                     static_disc_label = None
                     
                 loss, loss_survival, _, _, loss_brier = self.loss_fn(
-                    pred, time_bins, event_indicator,
+                    pred, time_bins, event_indicator, observation_bins,
                     recon, x, static_recon, static_x, 
                     mask_nan, disc_pred, disc_label,
                     mask_nan_static, static_disc_pred, static_disc_label
@@ -370,10 +522,11 @@ class CliTsSurv(nn.Module):
                 all_survival_losses.append(loss_survival.detach().cpu().numpy())
                 all_brier_losses.append(loss_brier.detach().cpu().numpy())
                 
-                # Risk score: cumulative event probability
-                event_probs = pred[:, :-1]
-                cumulative_event_prob = torch.cumsum(event_probs, dim=-1)
-                risk_score = cumulative_event_prob[:, -1]
+                # Model selection uses risk conditional on surviving beyond a.
+                conditional_event, _, _ = conditional_event_distribution(
+                    pred, observation_bins, self.num_time_bins
+                )
+                risk_score = conditional_event.sum(dim=-1)
                 
                 all_pred_risks.extend(risk_score.cpu().numpy().tolist())
                 all_times.extend(time_to_event.cpu().numpy().tolist())
@@ -455,11 +608,11 @@ class CliTsSurv(nn.Module):
         return x_tensor, static_x_tensor, lens_tensor, times_tensor
 
     def predict_survival(self, x, t, static_x=None, lens=None, times=None, risk=1, bs=100):
-        """Predict survival function S(t) for given time points.
+        """Predict conditional survival S(t)/S(a) for given absolute times.
         
         Aligns with DDH's predict_survival behavior:
         - Converts continuous time t to bin indices using time_bin_edges
-        - Returns survival probability S(t) = 1 - F(t) at specified time points
+        - Conditions the absolute softmax distribution on survival beyond a
         
         Args:
             x: List of arrays or numpy array of sequences (batch, T, features)
@@ -471,7 +624,7 @@ class CliTsSurv(nn.Module):
             bs: Batch size for prediction
             
         Returns:
-            survival_probs: (batch, len(t)) array of survival probabilities at specified times
+            survival_probs: (batch, len(t)) conditional survival probabilities
         """
         self.eval()
         
@@ -537,22 +690,29 @@ class CliTsSurv(nn.Module):
                 pred, _, _, _, _ = self.forward(x_tensor, static_x_tensor, lens_tensor, times_tensor)
                 # pred: (batch, num_time_bins + 1) - softmax probabilities
                 
-                # Calculate cumulative event probability F(t) = sum_{k=0}^{t} P(k)
-                event_probs = pred[:, :-1]  # (batch, num_time_bins)
-                cumsum_event_probs = torch.cumsum(event_probs, dim=1)  # (batch, num_time_bins)
-                
-                # Survival probability S(t) = 1 - F(t)
-                survival_probs = 1.0 - cumsum_event_probs  # (batch, num_time_bins)
+                observation_bins, observation_times = self._observation_bins(
+                    x_tensor, lens_tensor, times_tensor, self.time_bin_edges
+                )
+                survival_probs = conditional_survival_curve(
+                    pred, observation_bins, self.num_time_bins
+                )
                 
                 # Extract survival probability at requested time points
                 # For each requested time t_i, get survival_probs[:, t_bins[i]]
-                batch_survival = survival_probs[:, t_bins].cpu().numpy()
+                batch_survival = survival_probs[:, t_bins]
+                query_times = torch.as_tensor(
+                    t, dtype=observation_times.dtype, device=observation_times.device
+                ).unsqueeze(0)
+                batch_survival = torch.where(
+                    query_times <= observation_times.unsqueeze(1),
+                    torch.ones_like(batch_survival), batch_survival
+                ).cpu().numpy()
                 all_survival_probs.append(batch_survival)
         
         return np.concatenate(all_survival_probs, axis=0)  # (n_samples, len(t))
 
     def predict_risk(self, x, t, static_x=None, lens=None, times=None, risk=1, bs=100):
-        """Predict risk (cumulative incidence) at given time points.
+        """Predict conditional risk after the last non-zero observation.
         
         Aligns with DDH's predict_risk behavior:
         risk(t) = 1 - S(t) = F(t) = cumulative probability of event by time t

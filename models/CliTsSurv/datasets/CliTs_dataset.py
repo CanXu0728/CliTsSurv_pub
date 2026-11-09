@@ -39,11 +39,9 @@ class CliTsSurvDataset(Dataset):
             time_to_event = patient_df[time_to_event_col].iloc[-1]
             event_indicator = patient_df[event_indicator_col].iloc[-1]
             
-            # 如果事件时间大于最后一次随访时间，追加一个时间点
-            # 确保模型能看到事件发生/删失的时间点
             if len(time) > 0 and time_to_event > time[-1]:
                 time = np.append(time, time_to_event)
-                # 追加一行全0特征（与 DDH 一致）
+                # Append a zero-valued feature row.
                 zero_features = np.zeros(len(feature_cols))
                 x = np.vstack([x, zero_features])
             

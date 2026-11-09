@@ -1,8 +1,5 @@
 #!/usr/bin/env python3
-"""
-CliTsSurv 训练脚本
-基于 CliTsDeepHit 训练脚本修改，适配 CliTsSurv 模型
-"""
+"""Train CliTsSurv for discrete-time survival prediction."""
 
 import json
 import numpy as np
@@ -11,9 +8,9 @@ import torch
 from pathlib import Path
 from torch.utils.data import DataLoader, WeightedRandomSampler
 
-# 导入 CliTsSurv 组件
+# Import CliTsSurv components.
 import sys
-sys.path.insert(0, '/Volumes/Workspace/code/causalTS')
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).parent))
 from utils import evaluate_survival_metrics
 
@@ -27,11 +24,11 @@ from models.CliTsSurv.datasets import CliTsSurvDataset, collate_fn
 # Device
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-# 配置
+# Configuration.
 DATA_DIR     = Path(__file__).parent.parent / 'data' / 'CliTsSurv_data'
 BASE_SAVE_DIR = Path(__file__).parent.parent / 'checkpoints' / 'CliTsSurv' / 'learn_time_lstm_sincos'
 BASE_SAVE_DIR.mkdir(parents=True, exist_ok=True)
-# 保存每轮结果到 CSV
+# Save each run's results to CSV.
 RESULTS_DIR = Path(__file__).parent.parent / 'results' / 'clitssurv'
 CSV_PATH = RESULTS_DIR / 'repeated_training_results_lstm_sincos.csv'
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -39,8 +36,8 @@ RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 # Repeated training
 N_RUNS     = 1
 SEED_START = 1000
-PRETRAINED_ENCODER = "./checkpoints/pretrained/pretrained_seq_encoder.pt"  # 可选预训练编码器路径
-PRETRAINED_STATIC_ENCODER = "./checkpoints/pretrained/pretrained_static_encoder.pt"  # 可选预训练静态编码器路径
+PRETRAINED_ENCODER = "./checkpoints/pretrained/pretrained_seq_encoder.pt"  # Optional pretrained sequence-encoder path.
+PRETRAINED_STATIC_ENCODER = "./checkpoints/pretrained/pretrained_static_encoder.pt"  # Optional pretrained static-encoder path.
 
 # Training
 BATCH_SIZE = 32
@@ -72,8 +69,8 @@ STATIC_ENCODER_ARGS = {
 }
 
 # RNN backbone
-# Backbone: rnn_type 可选 'lstm' | 'gru' | 'transformer'
-# nhead / dim_feedforward / dropout 仅 transformer 使用，rnn 时忽略
+# Backbone rnn_type: 'lstm', 'gru' or 'transformer'.
+# nhead, dim_feedforward and dropout configure the Transformer path.
 NET_ARGS = {
     'hidden_size': 64,
     'num_layers': 3,
@@ -105,14 +102,14 @@ AUG_CONFIGS = [
 
 
 def load_data(data_dir: Path):
-    """加载预处理后的数据"""
+    """Load preprocessed data and metadata."""
     print("[1/4] 加载数据...")
     
-    # 加载元数据
+    # Load metadata.
     with open(data_dir / "metadata.json", 'r') as f:
         meta = json.load(f)
     
-    # 加载合并后的数据 (支持 CSV 或 Parquet)
+    # Load merged data from CSV or Parquet.
     csv_path = data_dir / "merged.csv"
     parquet_path = data_dir / "merged.parquet"
     if csv_path.exists():
@@ -122,7 +119,7 @@ def load_data(data_dir: Path):
         df = pd.read_parquet(parquet_path)
         print("  使用 Parquet 格式加载")
     
-    # 加载时间区间边界
+    # Load time-bin boundaries.
     time_bin_edges = np.load(data_dir / "time_bin_edges.npy")
     
     print(f"  样本数: {meta['n_unique_ids']} 患者")
@@ -134,12 +131,12 @@ def load_data(data_dir: Path):
 
 
 def split_train_test(df: pd.DataFrame, test_ratio=0.15, val_ratio=0.15, random_seed=42):
-    """划分训练/验证/测试集"""
+    """Create patient-level training, validation and test partitions."""
     print("\n[2/4] 划分数据集...")
     
     np.random.seed(random_seed)
     
-    # 按患者ID划分
+    # Split by patient ID.
     unique_ids = df['id'].unique()
     np.random.shuffle(unique_ids)
     
@@ -162,10 +159,10 @@ def split_train_test(df: pd.DataFrame, test_ratio=0.15, val_ratio=0.15, random_s
 
 
 def create_dataloaders(train_df, val_df, test_df, meta, batch_size=32, device='cuda'):
-    """创建 DataLoader"""
+    """Create data loaders for the patient partitions."""
     print("\n[3/4] 创建 DataLoaders...")
     
-    # Dataset 参数
+    # Dataset parameters.
     dataset_kwargs = {
         'feature_cols': meta['seq_feature_cols'],
         'time_to_event_col': 'time_to_event',
@@ -175,7 +172,7 @@ def create_dataloaders(train_df, val_df, test_df, meta, batch_size=32, device='c
         'infer': False,
     }
     
-    # 创建 Datasets
+    # Create datasets.
     train_dataset = CliTsSurvDataset(train_df, **dataset_kwargs)
     val_dataset = CliTsSurvDataset(val_df, **dataset_kwargs)
     test_dataset = CliTsSurvDataset(test_df, **dataset_kwargs)
@@ -184,9 +181,9 @@ def create_dataloaders(train_df, val_df, test_df, meta, batch_size=32, device='c
     train_weights = np.where(np.array(train_dataset.event_indicator) == 1, 
                              (len(train_dataset.event_indicator)-num_events)/num_events, 1)
     train_sampler = WeightedRandomSampler(train_weights, len(train_dataset.event_indicator), replacement=True)
-    # train_sampler = None  # 目前不使用采样器，直接 shuffle=True
+    # train_sampler = None  # Alternative: use shuffle=True without a sampler.
     
-    # 创建 DataLoaders
+    # Create data loaders.
     train_loader = DataLoader(
         train_dataset, 
         batch_size=batch_size, 
@@ -219,10 +216,10 @@ def create_dataloaders(train_df, val_df, test_df, meta, batch_size=32, device='c
 
 
 def create_model(meta, num_time_bins=10, device='cuda'):
-    """创建 CliTsSurv 模型"""
+    """Construct the CliTsSurv model."""
     print("\n[4/4] 创建模型...")
 
-    # 特征维度
+    # Feature dimensions.
     conti_feature_in = meta['n_seq_features']
     bi_feature_in = 0
     static_conti_feature_in = meta['n_static_features']
@@ -277,12 +274,12 @@ def create_model(meta, num_time_bins=10, device='cuda'):
 def train_model(model, train_loader, val_loader, time_bin_edges, 
                 epochs=100, lr=0.001, save_dir='./checkpoints',
                 optimizer_type='adam', optimizer_kwargs=None):
-    """训练模型"""
+    """Train the model."""
     print("\n" + "="*60)
     print("开始训练")
     print("="*60)
     
-    # 设置 time_bin_edges 用于 predict_survival/predict_risk
+    # Set time_bin_edges for predict_survival and predict_risk.
     model.time_bin_edges = time_bin_edges
     
     model.train_model(
@@ -300,20 +297,9 @@ def train_model(model, train_loader, val_loader, time_bin_edges,
 
 
 def _collect_survival_data_with_times(model, loader, time_bin_edges, device, eval_times):
-    """收集每个评估时间点的风险评分（与 DDH 对齐）
-    
-    Args:
-        model: CliTsSurv 模型
-        loader: DataLoader
-        time_bin_edges: 时间区间边界
-        device: 设备
-        eval_times: 评估时间点数组 (n_times,)
-    
-    Returns:
-        times: (N,) 真实时间
-        events: (N,) 事件指示
-        risk_scores: (N, n_times) 每个评估时间点的风险评分
-    """
+    """Collect outcomes and risk scores at the requested evaluation times.
+
+Return times (N,), events (N,) and risk_scores (N, n_times)."""
     model.eval()
     all_times, all_events = [], []
     all_risk_scores = []
@@ -324,17 +310,17 @@ def _collect_survival_data_with_times(model, loader, time_bin_edges, device, eva
             tte, evt = batch[2], batch[3]
             lens, times_emb = batch[4], batch[5]
             
-            # 转换数据格式用于 predict_risk
+            # Convert inputs for predict_risk.
             x_np = x.cpu().numpy()
             static_x_np = static_x.cpu().numpy()
-            # lens 可能是 list，需要检查
+            # Sequence lengths may be a list rather than a tensor.
             if isinstance(lens, list):
                 lens_np = np.array(lens)
             else:
                 lens_np = lens.cpu().numpy()
             times_np = times_emb.cpu().numpy()
             
-            # 使用 predict_risk 获取每个时间点的风险评分
+            # Get risk scores at each evaluation time using predict_risk.
             risk_scores = model.predict_risk(
                 x=x_np,
                 t=eval_times,
@@ -352,18 +338,7 @@ def _collect_survival_data_with_times(model, loader, time_bin_edges, device, eva
 
 
 def _collect_survival_probs_with_times(model, loader, time_bin_edges, device, eval_times):
-    """收集每个评估时间点的生存概率
-    
-    Args:
-        model: CliTsSurv 模型
-        loader: DataLoader
-        time_bin_edges: 时间区间边界
-        device: 设备
-        eval_times: 评估时间点数组 (n_times,)
-    
-    Returns:
-        survival_probs: (N, n_times) 每个评估时间点的生存概率
-    """
+    """Collect survival probabilities with shape (N, n_times)."""
     model.eval()
     all_survival_probs = []
     
@@ -373,7 +348,7 @@ def _collect_survival_probs_with_times(model, loader, time_bin_edges, device, ev
             tte, evt = batch[2], batch[3]
             lens, times_emb = batch[4], batch[5]
             
-            # 转换数据格式
+            # Convert input formats.
             x_np = x.cpu().numpy()
             static_x_np = static_x.cpu().numpy()
             if isinstance(lens, list):
@@ -382,7 +357,7 @@ def _collect_survival_probs_with_times(model, loader, time_bin_edges, device, ev
                 lens_np = lens.cpu().numpy()
             times_np = times_emb.cpu().numpy()
             
-            # 使用 predict_survival 获取每个时间点的生存概率
+            # Get survival probabilities at each evaluation time using predict_survival.
             survival_probs = model.predict_survival(
                 x=x_np,
                 t=eval_times,
@@ -398,9 +373,9 @@ def _collect_survival_probs_with_times(model, loader, time_bin_edges, device, ev
 
 
 def _evaluate_ipcw(model, train_loader, test_loader, time_bin_edges, device, save_dir=None):
-    """用 concordance_index_ipcw 评估，和 DDH 的指标对齐"""
+    """Evaluate survival predictions using IPCW concordance and related metrics."""
 
-    # 先收集训练集数据用于 IPCW 计算
+    # Collect training outcomes for IPCW estimation.
     t_train_list, e_train_list = [], []
     model.eval()
     with torch.no_grad():
@@ -411,7 +386,7 @@ def _evaluate_ipcw(model, train_loader, test_loader, time_bin_edges, device, sav
     t_train = np.array(t_train_list)
     e_train = np.array(e_train_list)
     
-    # 收集测试集数据（时间和事件）
+    # Collect evaluation times and event indicators.
     t_test_list, e_test_list = [], []
     with torch.no_grad():
         for batch in test_loader:
@@ -421,14 +396,14 @@ def _evaluate_ipcw(model, train_loader, test_loader, time_bin_edges, device, sav
     t_test = np.array(t_test_list)
     e_test = np.array(e_test_list)
 
-    # 三个评估时间点：25% / 50% / 75% 分位数（仅用训练集，避免测试集泄漏）
+    # Use training-derived Q25, Q50 and Q75 evaluation horizons.
     horizons = [0.25, 0.50, 0.75]
     valid_times = np.quantile(t_train[e_train == 1], horizons)
-    # 确保评估时间点在训练集范围内（IPCW 要求）
+    # Keep evaluation horizons within the training range for IPCW.
     t_max_train = t_train.max()
     valid_times = np.clip(valid_times, t_train.min(), t_max_train * 0.99)
 
-    # 收集每个评估时间点的风险评分和生存概率
+    # Collect risk scores and survival probabilities at each evaluation time.
     _, _, risk_scores = _collect_survival_data_with_times(
         model, test_loader, time_bin_edges, device, valid_times
     )
@@ -446,7 +421,7 @@ def _evaluate_ipcw(model, train_loader, test_loader, time_bin_edges, device, sav
         split_name='Test',
     )
 
-    # 写入平均 IPCW c-index
+    # Store mean IPCW C-index.
     if metrics['mean_ipcw'] is not None and save_dir is not None:
         avg_ipcw = metrics['mean_ipcw']
         ipcw_path = Path(save_dir) / "ipcw_score"
@@ -497,7 +472,7 @@ def main():
 
     save_hparams(BASE_SAVE_DIR)
 
-    # 1. 加载数据（只加载一次）
+    # 1. Load data once.
     df, meta, time_bin_edges = load_data(DATA_DIR)
 
     all_metrics = []
@@ -511,27 +486,27 @@ def main():
         print(f"Run {run+1}/{N_RUNS}  (seed={seed})")
         print('='*60)
 
-        # 2. 划分数据集
+        # 2. Split the dataset.
         train_df, val_df, test_df = split_train_test(
             df, test_ratio=TEST_RATIO, val_ratio=VAL_RATIO, random_seed=seed
         )
 
-        # 3. 创建 DataLoaders
+        # 3. Create data loaders.
         train_loader, val_loader, test_loader = create_dataloaders(
             train_df, val_df, test_df, meta, BATCH_SIZE, DEVICE
         )
 
-        # 4. 创建模型
+        # 4. Create the model.
         model = create_model(meta, num_time_bins=len(time_bin_edges)-1, device=DEVICE)
         model.time_bin_edges = time_bin_edges
 
-        # 5. 训练
+        # 5. Train.
         train_model(model, train_loader, val_loader, time_bin_edges,
                     epochs=EPOCHS, lr=LR, save_dir=str(SAVE_DIR),
                     optimizer_type='adam',
                     optimizer_kwargs=None)
 
-        # 6. 评估
+        # 6. Evaluate.
         metrics = _evaluate_ipcw(
             model, train_loader, test_loader, time_bin_edges, DEVICE,
             save_dir=str(SAVE_DIR)
@@ -539,7 +514,7 @@ def main():
         if metrics is not None:
             all_metrics.append(metrics)
 
-    # 汇总结果
+    # Summarize results.
     print("\n" + "="*60)
     print(f"汇总结果 ({len(all_metrics)}/{N_RUNS} runs 成功)")
     print("="*60)
